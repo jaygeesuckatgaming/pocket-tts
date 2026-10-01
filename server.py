@@ -16,6 +16,7 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import numpy as np
 import scipy.io.wavfile
+import scipy.signal
 
 from pocket_tts import TTSModel
 
@@ -29,6 +30,7 @@ config.read(config_file)
 try:
     REFERENCE_VOICE = config.get('TTS', 'reference_voice')
     DEVICE = config.get('TTS', 'device', fallback='cpu')
+    SPEED = config.getfloat('TTS', 'speed', fallback=1.0)
     SERVER_HOST = config.get('Server', 'host')
     SERVER_PORT = config.getint('Server', 'port')
     SERVER_DEBUG = config.getboolean('Server', 'debug')
@@ -99,6 +101,28 @@ def tts_endpoint():
             audio_np = audio_np[0]
         sample_rate = model.sample_rate
 
+        # Apply speech-rate (speed) via Rubber Band time-stretch (high-quality, pitch-preserving).
+        # speed=1.0 = unchanged; >1.0 = faster, <1.0 = slower.
+        if SPEED and abs(SPEED - 1.0) > 0.001:
+            try:
+                import pyrubberband.pyrb as _pyrb
+                # Locate the rubberband binary. conda-forge on Windows names it
+                # rubberband-program.exe inside the env's Library/bin folder.
+                import shutil
+                exe = shutil.which('rubberband') or shutil.which('rubberband-program')
+                if not exe:
+                    env_lib_bin = os.path.join(sys.prefix, 'Library', 'bin', 'rubberband-program.exe')
+                    if os.path.exists(env_lib_bin):
+                        exe = env_lib_bin
+                if exe:
+                    _pyrb.__RUBBERBAND_UTIL = exe
+                audio_np = _pyrb.time_stretch(audio_np.astype(np.float32), sample_rate, SPEED)
+                print(f"Applied speech speed {SPEED}x (rubberband) -> {len(audio_np)} samples")
+            except Exception as e:
+                print(f"Warning: rubberband time-stretch failed ({e}), using librosa fallback")
+                import librosa
+                audio_np = librosa.effects.time_stretch(audio_np.astype(np.float32), rate=SPEED)
+
         # Save to centralized TTS output folder for watcher_to_face.py
         script_dir = os.path.dirname(os.path.abspath(__file__))
         tts_output_folder = os.path.join(os.path.dirname(os.path.dirname(script_dir)), "tts_output")
@@ -136,9 +160,30 @@ def get_settings():
     return jsonify({
         'reference_voice': REFERENCE_VOICE,
         'device': DEVICE,
+        'speed': SPEED,
         'host': SERVER_HOST,
         'port': SERVER_PORT,
     })
+
+
+@app.route('/settings', methods=['POST'])
+def update_settings():
+    """Update Pocket TTS settings (writes to settings.ini)."""
+    global SPEED
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    if 'speed' in data:
+        SPEED = float(data['speed'])
+        try:
+            config.set('TTS', 'speed', str(SPEED))
+            with open(config_file, 'w') as f:
+                config.write(f)
+        except Exception as e:
+            return jsonify({"error": f"Failed to save speed: {e}"}), 500
+
+    return jsonify({"status": "ok", "speed": SPEED})
 
 
 if __name__ == "__main__":
